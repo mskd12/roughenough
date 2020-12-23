@@ -16,6 +16,9 @@
 #[macro_use]
 extern crate clap;
 
+extern crate itertools;
+use itertools::Itertools;
+
 use ring::rand;
 use ring::rand::SecureRandom;
 
@@ -53,9 +56,13 @@ fn make_request(nonce: &[u8]) -> Vec<u8> {
     msg.encode().unwrap()
 }
 
-fn receive_response(sock: &mut UdpSocket) -> RtMessage {
+fn receive_response(sock: &mut UdpSocket, f: &mut Option<File>) -> RtMessage {
     let mut buf = [0; 744];
     let resp_len = sock.recv_from(&mut buf).unwrap().0;
+
+    if let Some(f) = f.as_mut() {
+        f.write_all(&buf[0..resp_len]).expect("Failed to write to file!")
+    }
 
     RtMessage::from_bytes(&buf[0..resp_len]).unwrap()
 }
@@ -84,10 +91,11 @@ struct ResponseHandler {
     nonce: [u8; 64],
 }
 
-struct ParsedResponse {
+struct ParsedResponse<'a> {
     verified: bool,
     midpoint: u64,
     radius: u32,
+    signature: &'a [u8]
 }
 
 impl ResponseHandler {
@@ -122,6 +130,7 @@ impl ResponseHandler {
             .as_slice()
             .read_u32::<LittleEndian>()
             .unwrap();
+        let signature = &self.msg[&Tag::SIG];
 
         let verified = if self.pub_key.is_some() {
             self.validate_dele();
@@ -137,6 +146,7 @@ impl ResponseHandler {
             verified,
             midpoint,
             radius,
+            signature
         }
     }
 
@@ -214,6 +224,12 @@ impl ResponseHandler {
 fn main() {
     let matches = App::new("roughenough client")
     .version(roughenough_version().as_ref())
+    .arg(Arg::with_name("nonce")
+      .short("c")
+      .long("nonce")
+      .takes_value(true)
+      .help("Specify input nonce. If unset, a random nonce will be used.")
+    )
     .arg(Arg::with_name("host")
       .required(true)
       .help("The Roughtime server to connect to.")
@@ -242,13 +258,6 @@ fn main() {
       .help("The strftime format string used to print the time recieved from the server.")
       .default_value("%b %d %Y %H:%M:%S %Z")
     )
-    .arg(Arg::with_name("num-requests")
-      .short("n")
-      .long("num-requests")
-      .takes_value(true)
-      .help("The number of requests to make to the server (each from a different source port). This is mainly useful for testing batch response handling.")
-      .default_value("1")
-    )
     .arg(Arg::with_name("stress")
       .short("s")
       .long("stress")
@@ -260,6 +269,12 @@ fn main() {
       .takes_value(true)
       .help("Writes all requests to the specified file, in addition to sending them to the server. Useful for generating fuzzer inputs.")
     )
+    .arg(Arg::with_name("transcript")
+      .short("t")
+      .long("transcript")
+      .takes_value(true)
+      .help("Writes all responses to the specified file.")
+    )
     .arg(Arg::with_name("zulu")
       .short("z")
       .long("zulu")
@@ -267,17 +282,21 @@ fn main() {
     )
     .get_matches();
 
+    let inp_nonce = matches
+        .value_of("nonce")
+        .map(|nc| hex::decode(nc).expect("Error parsing nonce!"));
     let host = matches.value_of("host").unwrap();
     let port = value_t_or_exit!(matches.value_of("port"), u16);
     let verbose = matches.is_present("verbose");
     let json = matches.is_present("json");
-    let num_requests = value_t_or_exit!(matches.value_of("num-requests"), u16) as usize;
+    // let num_requests = value_t_or_exit!(matches.value_of("num-requests"), u16) as usize;
     let time_format = matches.value_of("time-format").unwrap();
     let stress = matches.is_present("stress");
     let pub_key = matches
         .value_of("public-key")
         .map(|pkey| hex::decode(pkey).expect("Error parsing public key!"));
     let out = matches.value_of("output");
+    let resp_out = matches.value_of("transcript");
     let use_utc = matches.is_present("zulu");
 
     if verbose {
@@ -290,67 +309,80 @@ fn main() {
         stress_test_forever(&addr)
     }
 
-    let mut requests = Vec::with_capacity(num_requests);
-    let mut file = out.map(|o| File::create(o).expect("Failed to create file!"));
 
-    for _ in 0..num_requests {
-        let nonce = create_nonce();
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("Couldn't open UDP socket");
-        let request = make_request(&nonce);
+    // let mut requests = Vec::with_capacity(num_requests);
+    let mut req_file = out.map(|o| File::create(o).expect("Failed to create file!"));
 
-        if let Some(f) = file.as_mut() {
-            f.write_all(&request).expect("Failed to write to file!")
+    // for _ in 0..num_requests {
+    let nonce = if inp_nonce.is_some() {
+        let x = inp_nonce.unwrap();
+        if x.len() != 64 {
+            panic!("Exp 64. Input nonce length: {}", x.len());
         }
+        x
+    } else {
+        create_nonce().to_vec()
+    };
+    println!("Nonce: {:02x}", nonce.iter().format(""));
+    let mut socket = UdpSocket::bind("0.0.0.0:0").expect("Couldn't open UDP socket");
+    let request = make_request(&nonce);
 
-        requests.push((nonce, request, socket));
+    if let Some(f) = req_file.as_mut() {
+        f.write_all(&request).expect("Failed to write to file!")
     }
 
-    for &mut (_, ref request, ref mut socket) in &mut requests {
-        socket.send_to(request, addr).unwrap();
+    socket.send_to(&request, addr).unwrap();
+
+    let mut resp_file = resp_out.map(|o| File::create(o).expect("Failed to create file!"));
+
+    // for (nonce, _, mut socket) in requests {
+    let resp = receive_response(&mut socket, &mut resp_file);
+
+    let mut arr_nonce: [u8; 64] = [0; 64];
+    arr_nonce.copy_from_slice(&nonce[0..64]);
+
+    let d = ResponseHandler::new(pub_key.clone(), resp.clone(), arr_nonce);
+    let ParsedResponse {
+        verified,
+        midpoint,
+        radius,
+        signature,
+    } = d.extract_time();
+
+    println!("Sign: {:02x}", signature.iter().format(""));
+
+    let map = resp.into_hash_map();
+    let index = map[&Tag::INDX]
+        .as_slice()
+        .read_u32::<LittleEndian>()
+        .unwrap();
+
+    let seconds = midpoint / 10_u64.pow(6);
+    let nsecs = (midpoint - (seconds * 10_u64.pow(6))) * 10_u64.pow(3);
+    let verify_str = if verified { "Yes" } else { "No" };
+
+    let out = if use_utc {
+        let ts = Utc.timestamp(seconds as i64, nsecs as u32);
+        ts.format(time_format).to_string()
+    } else {
+        let ts = Local.timestamp(seconds as i64, nsecs as u32);
+        ts.format(time_format).to_string()
+    };
+
+    if verbose {
+        eprintln!(
+            "Received time from server: midpoint={:?}, radius={:?}, verified={} (merkle_index={})",
+            out, radius, verify_str, index
+        );
     }
 
-    for (nonce, _, mut socket) in requests {
-        let resp = receive_response(&mut socket);
-
-        let ParsedResponse {
-            verified,
-            midpoint,
-            radius,
-        } = ResponseHandler::new(pub_key.clone(), resp.clone(), nonce).extract_time();
-
-        let map = resp.into_hash_map();
-        let index = map[&Tag::INDX]
-            .as_slice()
-            .read_u32::<LittleEndian>()
-            .unwrap();
-
-        let seconds = midpoint / 10_u64.pow(6);
-        let nsecs = (midpoint - (seconds * 10_u64.pow(6))) * 10_u64.pow(3);
-        let verify_str = if verified { "Yes" } else { "No" };
-
-        let out = if use_utc {
-            let ts = Utc.timestamp(seconds as i64, nsecs as u32);
-            ts.format(time_format).to_string()
-        } else {
-            let ts = Local.timestamp(seconds as i64, nsecs as u32);
-            ts.format(time_format).to_string()
-        };
-
-        if verbose {
-            eprintln!(
-                "Received time from server: midpoint={:?}, radius={:?}, verified={} (merkle_index={})",
-                out, radius, verify_str, index
-            );
-        }
-
-        if json {
-            println!(
-                r#"{{ "midpoint": {:?}, "radius": {:?}, "verified": {}, "merkle_index": {} }}"#,
-                out, radius, verified, index
-            );
-        } else {
-            println!("{}", out);
-        }
+    if json {
+        println!(
+            r#"{{ "midpoint": {:?}, "radius": {:?}, "verified": {}, "merkle_index": {} }}"#,
+            out, radius, verified, index
+        );
+    } else {
+        println!("{}", out);
     }
 }
 
