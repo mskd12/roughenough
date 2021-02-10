@@ -12,26 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// for value_t_or_exit!()
-#[macro_use]
-extern crate clap;
+/**
+    Roughtime transcript verifier 
+    (copied mostly from roughenough-client.rs)
+
+    Author: Deepak
+*/
 
 extern crate itertools;
 use itertools::Itertools;
 
-use ring::rand;
-use ring::rand::SecureRandom;
-
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use chrono::offset::Utc;
 use chrono::{TimeZone, Local};
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Write;
-use std::iter::Iterator;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::io::Read;
 
 use clap::{App, Arg};
 use roughenough::merkle::root_from_paths;
@@ -39,48 +36,6 @@ use roughenough::sign::Verifier;
 use roughenough::{
     roughenough_version, RtMessage, Tag, CERTIFICATE_CONTEXT, SIGNED_RESPONSE_CONTEXT,
 };
-
-fn create_nonce() -> [u8; 64] {
-    let rng = rand::SystemRandom::new();
-    let mut nonce = [0u8; 64];
-    rng.fill(&mut nonce).unwrap();
-
-    nonce
-}
-
-fn make_request(nonce: &[u8]) -> Vec<u8> {
-    let mut msg = RtMessage::new(1);
-    msg.add_field(Tag::NONC, nonce).unwrap();
-    msg.pad_to_kilobyte();
-
-    msg.encode().unwrap()
-}
-
-fn receive_response(sock: &mut UdpSocket, f: &mut Option<File>) -> RtMessage {
-    let mut buf = [0; 744];
-    let resp_len = sock.recv_from(&mut buf).unwrap().0;
-
-    if let Some(f) = f.as_mut() {
-        f.write_all(&buf[0..resp_len]).expect("Failed to write to file!")
-    }
-
-    RtMessage::from_bytes(&buf[0..resp_len]).unwrap()
-}
-
-fn stress_test_forever(addr: &SocketAddr) -> ! {
-    if !addr.ip().is_loopback() {
-        panic!("Cannot use non-loopback address {} for stress testing", addr.ip());
-    }
-
-    println!("Stress testing!");
-
-    let nonce = create_nonce();
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("Couldn't open UDP socket");
-    let request = make_request(&nonce);
-    loop {
-        socket.send_to(&request, addr).unwrap();
-    }
-}
 
 struct ResponseHandler {
     pub_key: Option<Vec<u8>>,
@@ -222,7 +177,7 @@ impl ResponseHandler {
 }
 
 fn main() {
-    let matches = App::new("roughenough client")
+    let matches = App::new("roughenough transcript verifier")
     .version(roughenough_version().as_ref())
     .arg(Arg::with_name("nonce")
       .short("c")
@@ -230,22 +185,10 @@ fn main() {
       .takes_value(true)
       .help("Specify input nonce. If unset, a random nonce will be used.")
     )
-    .arg(Arg::with_name("host")
-      .required(true)
-      .help("The Roughtime server to connect to.")
-      .takes_value(true))
-    .arg(Arg::with_name("port")
-      .required(true)
-      .help("The Roughtime server port to connect to.")
-      .takes_value(true))
     .arg(Arg::with_name("verbose")
       .short("v")
       .long("verbose")
       .help("Output additional details about the server's response."))
-    .arg(Arg::with_name("json")
-      .short("j")
-      .long("json")
-      .help("Output the server's response in JSON format."))
     .arg(Arg::with_name("public-key")
       .short("p")
       .long("public-key")
@@ -258,60 +201,23 @@ fn main() {
       .help("The strftime format string used to print the time recieved from the server.")
       .default_value("%b %d %Y %H:%M:%S %Z")
     )
-    .arg(Arg::with_name("stress")
-      .short("s")
-      .long("stress")
-      .help("Stress test the server by sending the same request as fast as possible. Please only use this on your own server.")
-    )
-    .arg(Arg::with_name("output")
-      .short("o")
-      .long("output")
-      .takes_value(true)
-      .help("Writes all requests to the specified file, in addition to sending them to the server. Useful for generating fuzzer inputs.")
-    )
     .arg(Arg::with_name("transcript")
       .short("t")
       .long("transcript")
       .takes_value(true)
       .help("Writes all responses to the specified file.")
     )
-    .arg(Arg::with_name("zulu")
-      .short("z")
-      .long("zulu")
-      .help("Display time in UTC (default is local time zone)")
-    )
     .get_matches();
 
     let inp_nonce = matches
         .value_of("nonce")
         .map(|nc| hex::decode(nc).expect("Error parsing nonce!"));
-    let host = matches.value_of("host").unwrap();
-    let port = value_t_or_exit!(matches.value_of("port"), u16);
     let verbose = matches.is_present("verbose");
-    let json = matches.is_present("json");
-    // let num_requests = value_t_or_exit!(matches.value_of("num-requests"), u16) as usize;
     let time_format = matches.value_of("time-format").unwrap();
-    let stress = matches.is_present("stress");
     let pub_key = matches
         .value_of("public-key")
         .map(|pkey| hex::decode(pkey).expect("Error parsing public key!"));
-    let out = matches.value_of("output");
     let resp_out = matches.value_of("transcript");
-    let use_utc = matches.is_present("zulu");
-
-    if verbose {
-        eprintln!("Requesting time from: {:?}:{:?}", host, port);
-    }
-
-    let addr = (host, port).to_socket_addrs().unwrap().next().unwrap();
-
-    if stress {
-        stress_test_forever(&addr)
-    }
-
-
-    // let mut requests = Vec::with_capacity(num_requests);
-    let mut req_file = out.map(|o| File::create(o).expect("Failed to create file!"));
 
     // for _ in 0..num_requests {
     let nonce = if inp_nonce.is_some() {
@@ -321,22 +227,14 @@ fn main() {
         }
         x
     } else {
-        create_nonce().to_vec()
+        panic!("Specify nonce used!");
     };
-    println!("[Roughtime] Nonce: {:02x}", nonce.iter().format(""));
-    let mut socket = UdpSocket::bind("0.0.0.0:0").expect("Couldn't open UDP socket");
-    let request = make_request(&nonce);
 
-    if let Some(f) = req_file.as_mut() {
-        f.write_all(&request).expect("Failed to write to file!")
-    }
+    let mut resp_file = resp_out.map(|o| File::open(o).expect("Failed to open file!")).unwrap();
 
-    socket.send_to(&request, addr).unwrap();
-
-    let mut resp_file = resp_out.map(|o| File::create(o).expect("Failed to create file!"));
-
-    // for (nonce, _, mut socket) in requests {
-    let resp = receive_response(&mut socket, &mut resp_file);
+    let mut buf = [0; 744];
+    let n = resp_file.read(&mut buf).expect("Failed to read file!");
+    let resp = RtMessage::from_bytes(&buf[0..n]).unwrap();
 
     let mut arr_nonce: [u8; 64] = [0; 64];
     arr_nonce.copy_from_slice(&nonce[0..64]);
@@ -349,9 +247,10 @@ fn main() {
         signature,
     } = d.extract_time();
 
-    println!("[Roughtime] Sign: {:02x}", signature.iter().format(""));
-    let mut sig_file = File::create("rt_sig.tmp").expect("Failed to create sig file!");
-    sig_file.write_all(signature).expect("Failed to write to file!");     
+    if verbose {
+        println!("[Roughtime] Nonce: {:02x}", nonce.iter().format(""));
+        println!("[Roughtime] Sign: {:02x}", signature.iter().format(""));    
+    }
     
     let map = resp.into_hash_map();
     let index = map[&Tag::INDX]
@@ -363,10 +262,9 @@ fn main() {
     let nsecs = (midpoint - (seconds * 10_u64.pow(6))) * 10_u64.pow(3);
     let verify_str = if verified { "Yes" } else { "No" };
 
-    let out = if use_utc {
-        let ts = Utc.timestamp(seconds as i64, nsecs as u32);
-        ts.format(time_format).to_string()
-    } else {
+    println!("{}", verified);
+
+    let out = {
         let ts = Local.timestamp(seconds as i64, nsecs as u32);
         ts.format(time_format).to_string()
     };
@@ -376,15 +274,6 @@ fn main() {
             "Received time from server: midpoint={:?}, radius={:?}, verified={} (merkle_index={})",
             out, radius, verify_str, index
         );
-    }
-
-    if json {
-        println!(
-            r#"{{ "midpoint": {:?}, "radius": {:?}, "verified": {}, "merkle_index": {} }}"#,
-            out, radius, verified, index
-        );
-    } else {
-        println!("[Roughtime] Server time: {}", out);
     }
 }
 
