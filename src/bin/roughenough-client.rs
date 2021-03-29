@@ -359,6 +359,7 @@ fn main() {
         .read_u32::<LittleEndian>()
         .unwrap();
 
+    let milliseconds = midpoint / 10_u64.pow(3);
     let seconds = midpoint / 10_u64.pow(6);
     let nsecs = (midpoint - (seconds * 10_u64.pow(6))) * 10_u64.pow(3);
     let verify_str = if verified { "Yes" } else { "No" };
@@ -373,8 +374,8 @@ fn main() {
 
     if verbose {
         eprintln!(
-            "Received time from server: midpoint={:?}, radius={:?}, verified={} (merkle_index={})",
-            out, radius, verify_str, index
+            "Received time from server: millis={:?}, midpoint={:?}, radius={:?}, verified={} (merkle_index={})",
+            milliseconds, out, radius, verify_str, index
         );
     }
 
@@ -384,7 +385,7 @@ fn main() {
             out, radius, verified, index
         );
     } else {
-        println!("[Roughtime] Server time: {}", out);
+        println!("[Roughtime] Server time: {}", milliseconds);
     }
 }
 
